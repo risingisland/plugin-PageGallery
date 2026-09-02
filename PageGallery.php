@@ -299,6 +299,7 @@ function PageGallery_edit_panel() {
 		<h4 class="pg-title"><svg xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle;" width="22" height="22" viewBox="0 0 48 48"><path d="M0 0h48v48H0z" fill="none"/><path fill="#E65100" d="M41 42H13c-2.2 0-4-1.8-4-4V18c0-2.2 1.8-4 4-4h28c2.2 0 4 1.8 4 4v20c0 2.2-1.8 4-4 4"/><path fill="#F57C00" d="M35 36H7c-2.2 0-4-1.8-4-4V12c0-2.2 1.8-4 4-4h28c2.2 0 4 1.8 4 4v20c0 2.2-1.8 4-4 4"/><circle cx="30" cy="16" r="3" fill="#FFF9C4"/><path fill="#942A09" d="M17 17.9L8 31h18z"/><path fill="#BF360C" d="M28 23.5L22 31h12z"/></svg> <?php i18n('PageGallery/lang_Panel_Title'); ?></h4>
 
 		<?php if (!$supports_now): ?>
+		<style>#pg-panel{display:none !important;}</style>
 		<p class="pg-warning"><?php i18n('PageGallery/lang_Template_Mismatch'); ?></p>
 		<?php endif ?>
 
