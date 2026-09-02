@@ -3,8 +3,10 @@
 Adds a page-level image gallery to GetSimpleCMS-CE, auto-detected per theme
 template. No manual per-template configuration is required: the plugin scans
 the template file currently assigned to a page for a literal
-`get_page_gallery(` call, and only then shows the gallery panel when that
+`get_page_gallery()` call, and only then shows the gallery panel when that
 page is edited.
+
+<img width="950" alt="image" src="https://github.com/user-attachments/assets/21b2522c-3f1b-4f4b-877e-58adeddc2a0f" />
 
 ## Installation
 
