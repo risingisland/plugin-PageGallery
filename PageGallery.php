@@ -3,7 +3,7 @@
 /*
 Plugin Name: Page Gallery
 Description: Adds a page-level image gallery, auto-detected per theme template. (SQLite3 required)
-Version: 1.0
+Version: 1.1
 Author: risingisland
 Author URI: https://ko-fi.com/ericmontgomery
 */
@@ -26,7 +26,7 @@ define('PageGallery_THUMB_URL',    $SITEURL . 'data/thumbs/');
 register_plugin(
 	PageGallery_SLUG,
 	'Page Gallery',
-	'1.0',
+	'1.1',
 	'risingisland',
 	'https://ko-fi.com/ericmontgomery',
 	i18n_r('PageGallery/lang_Description'),
@@ -42,10 +42,7 @@ add_action('theme-sidebar', 'createSideMenu', array(
 PageGallery_init_db();
 
 // ── Early AJAX intercept ──────────────────────────────────────────────────────
-// This plugin's admin UI is injected into GS's own edit.php (via the 'edit-content'
-// hook), not just our own admin page - so we can't gate this the way FormBuilderPro
-// does with a ?id= check. Any backend request carrying pg_action is handled here,
-// before any HTML has been emitted.
+
 if (!empty($_REQUEST['pg_action']) && !is_frontend()) {
 	PageGallery_handle_ajax($_REQUEST['pg_action']);
 	exit; // handle_ajax() always exit()s - safety net
@@ -133,23 +130,60 @@ function PageGallery_all_galleries() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UPLOADS / THUMBNAILS
-// Same conventions as Items Manager: browse and upload straight into the
-// standard GS uploads folder (with subfolder support), and generate the
-// standard GS thumbnail via the core imagemanipulation.php helper so these
-// uploads stay consistent with ones made through GS's own file browser.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Build a thumbnail URL for a filename (which may include a subfolder path).
-// Falls back to the full-size image if no thumbnail exists yet.
-function PageGallery_thumb_url($filename) {
+function PageGallery_encode_path($path) {
+	return implode('/', array_map('rawurlencode', explode('/', (string)$path)));
+}
+
+function PageGallery_image_url($filename) {
+	return PageGallery_UPLOAD_URL . PageGallery_encode_path($filename);
+}
+
+function PageGallery_resolve_folder($folder) {
+	$folder = trim(str_replace('\\', '/', (string)$folder), '/');
+	if ($folder === '') return '';
+	if (strpos($folder, "\0") !== false) return false;
+	foreach (explode('/', $folder) as $seg) {
+		if ($seg === '' || $seg === '.' || $seg === '..') return false;
+	}
+	$root = realpath(PageGallery_UPLOAD_DIR);
+	$dir  = realpath(PageGallery_UPLOAD_DIR . $folder);
+	if (!$root || !$dir || !is_dir($dir)) return false;
+	if (strpos($dir, $root . DIRECTORY_SEPARATOR) !== 0) return false;
+	return $folder;
+}
+
+function PageGallery_generate_thumb($dir, $name) {
+	static $loaded = false;
+	if (!$loaded) {
+		$imgmanip = GSADMININCPATH . 'imagemanipulation.php';
+		if (!file_exists($imgmanip)) return false;
+		require_once($imgmanip);
+		$loaded = true;
+	}
+	if (!function_exists('genStdThumb')) return false;
+	try {
+		@genStdThumb($dir, $name);
+	} catch (\Throwable $e) {
+		return false;
+	}
+	return true;
+}
+// Build a thumbnail URL for a filename
+function PageGallery_thumb_url($filename, $generate = false) {
 	$parts    = explode('/', $filename);
 	$basename = array_pop($parts);
 	$subdir   = count($parts) ? implode('/', $parts) . '/' : '';
-	$thumb_file = PageGallery_THUMB_DIR . $subdir . 'thumbnail.' . $basename;
-	if (file_exists($thumb_file)) {
-		return PageGallery_THUMB_URL . implode('/', array_map('rawurlencode', explode('/', $subdir . 'thumbnail.' . $basename)));
+	$thumb_rel  = $subdir . 'thumbnail.' . $basename;
+
+	if ($generate && !file_exists(PageGallery_THUMB_DIR . $thumb_rel) && file_exists(PageGallery_UPLOAD_DIR . $filename)) {
+		PageGallery_generate_thumb($subdir, $basename);
 	}
-	return PageGallery_UPLOAD_URL . implode('/', array_map('rawurlencode', explode('/', $filename)));
+	if (file_exists(PageGallery_THUMB_DIR . $thumb_rel)) {
+		return PageGallery_THUMB_URL . PageGallery_encode_path($thumb_rel);
+	}
+	return PageGallery_image_url($filename);
 }
 
 // Recursively list every image in the GS uploads folder, including subfolders.
@@ -171,7 +205,8 @@ function PageGallery_get_upload_images() {
 				if (!in_array($ext, $allowed)) continue;
 				$images[] = [
 					'filename' => $path,
-					'url'      => PageGallery_UPLOAD_URL . implode('/', array_map('rawurlencode', explode('/', $path))),
+					'url'      => PageGallery_image_url($path),
+					'thumb'    => PageGallery_thumb_url($path),
 					'folder'   => $rel ?: '',
 					'basename' => $file,
 				];
@@ -186,9 +221,6 @@ function PageGallery_get_upload_images() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TEMPLATE DETECTION
-// Scans a theme template file for a literal get_page_gallery( call, so the
-// admin gallery panel only appears where a theme developer has actually placed
-// the tag - no manual per-template configuration required.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function PageGallery_template_supports($template_file, $theme = null) {
@@ -248,25 +280,19 @@ function PageGallery_handle_page_save() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ADMIN PANEL  (hooked to 'edit-content', renders directly below the page
-// content textarea in edit.php)
+// ADMIN PANEL
 // ─────────────────────────────────────────────────────────────────────────────
 
 function PageGallery_edit_panel() {
 	global $url, $template, $TEMPLATE, $SITEURL;
-
-	// $url / $template / $TEMPLATE come from GS's page and website XML as
-	// SimpleXMLElement objects, not plain strings. String concatenation and
-	// echo coerce them fine, but array-key access and SQLite3::bindValue() do
-	// not - both throw a TypeError on a raw object. Cast up front and use the
-	// local string copies for everything from here on.
+	
 	$page_url      = (string)$url;
 	$tpl           = $template ? (string)$template : 'template.php';
 	$theme_name    = (string)$TEMPLATE;
 	$supports_map  = PageGallery_theme_templates($theme_name);
 	$supports_now  = $supports_map[$tpl] ?? PageGallery_template_supports($tpl, $theme_name);
 
-	// New, unsaved page - gallery data is keyed by page slug, which doesn't exist yet
+	// New, unsaved page
 	if (empty($page_url)) {
 		if (!$supports_now) return; // nothing to show at all
 		echo '<div class="pg-panel pg-panel-unsaved"><h4>' . i18n_r('PageGallery/lang_Panel_Title') . '</h4><p>'
@@ -279,8 +305,6 @@ function PageGallery_edit_panel() {
 
 	// Nothing to show: template doesn't call the tag, and no gallery data exists yet
 	if (!$supports_now && !$has_data) {
-		// Still emit a hidden container + supports map so the panel can appear live
-		// if the editor switches the page's template to one that supports it.
 		PageGallery_print_supports_script($supports_map);
 		echo '<div class="pg-panel" id="pg-panel" style="display:none;" data-slug="' . htmlspecialchars($page_url) . '"></div>';
 		return;
@@ -330,7 +354,7 @@ function PageGallery_edit_panel() {
 		<ul class="pg-grid" id="pg-grid">
 			<?php foreach ($images as $img): ?>
 			<li class="pg-thumb" draggable="true" data-id="<?= (int)$img['id'] ?>">
-				<img src="<?= htmlspecialchars(PageGallery_UPLOAD_URL . implode('/', array_map('rawurlencode', explode('/', $img['filename'])))) ?>" alt="">
+				<img src="<?= htmlspecialchars(PageGallery_thumb_url($img['filename'], true)) ?>" alt="">
 				<input type="text" class="pg-caption-input" placeholder="<?php echo strip_tags(i18n_r('PageGallery/lang_CaptionPlaceholder')); ?>" value="<?= htmlspecialchars($img['caption']) ?>">
 				<button type="button" class="pg-remove" title="<?php echo strip_tags(i18n_r('PageGallery/lang_Remove')); ?>">&times;</button>
 			</li>
@@ -531,7 +555,7 @@ function PageGallery_edit_panel() {
 			li.className = 'pg-thumb';
 			li.draggable = true;
 			li.dataset.id = img.id;
-			li.innerHTML = '<img src="' + img.url + '" alt="">' +
+			li.innerHTML = '<img src="' + (img.thumb || img.url) + '" alt="">' +
 				'<input type="text" class="pg-caption-input" placeholder="' + <?= json_encode(strip_tags(i18n_r('PageGallery/lang_CaptionPlaceholder'))) ?> + '" value="">' +
 				'<button type="button" class="pg-remove" title="' + <?= json_encode(strip_tags(i18n_r('PageGallery/lang_Remove'))) ?> + '">&times;</button>';
 			grid.appendChild(li);
@@ -608,7 +632,7 @@ function PageGallery_edit_panel() {
 			});
 			images.forEach(function(img){
 				out += '<div class="pg-fb-img" data-pick="' + fbEsc(img.filename) + '" title="' + fbEsc(img.filename) + '">'
-					+ '<img src="' + fbEsc(img.url) + '" alt="' + fbEsc(img.basename) + '" loading="lazy">'
+					+ '<img src="' + fbEsc(img.thumb || img.url) + '" alt="' + fbEsc(img.basename) + '" loading="lazy">'
 					+ '<span class="pg-fb-name">' + fbEsc(img.basename) + '</span>'
 					+ '</div>';
 			});
@@ -668,21 +692,22 @@ function PageGallery_edit_panel() {
 		if (uploadIn) uploadIn.addEventListener('change', function(){
 			var files = Array.prototype.slice.call(uploadIn.files || []);
 			if (!files.length) return;
-			var done = 0;
+			var done = 0, failMsg = '';
 			uploadSt.textContent = <?= json_encode(i18n_r('PageGallery/lang_Uploading')) ?> + ' 0 / ' + files.length + '\u2026';
 			files.forEach(function(file){
 				var fd = new FormData();
 				fd.append('pg_action', 'upload_image');
 				fd.append('slug', PG.slug);
+				fd.append('folder', fbFolder);   // upload into the folder currently open in the browser
 				fd.append('image', file);
 				fetch(PG.ajaxUrl, {method:'POST', body: fd})
 					.then(function(r){ return r.json(); })
 					.then(function(res){
 						done++;
 						uploadSt.textContent = <?= json_encode(i18n_r('PageGallery/lang_Uploading')) ?> + ' ' + done + ' / ' + files.length + '\u2026';
-						if (res.ok) appendThumb(res.image);
+						if (res.ok) appendThumb(res.image); else if (res.msg) failMsg = res.msg;
 						if (done === files.length) {
-							uploadSt.textContent = '';
+							uploadSt.textContent = failMsg;
 							uploadIn.value = '';
 							fbImages = []; // invalidate cache so Browse tab reflects the new upload
 						}
@@ -721,7 +746,7 @@ function PageGallery_print_supports_script($supports_map) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AJAX ENDPOINTS  (only reached via the early pg_action intercept above)
+// AJAX ENDPOINTS
 // ─────────────────────────────────────────────────────────────────────────────
 
 function PageGallery_handle_ajax($action) {
@@ -776,7 +801,8 @@ function PageGallery_handle_ajax($action) {
 
 			echo json_encode(['ok' => true, 'image' => [
 				'id' => $db->lastInsertRowID(), 'filename' => $filename,
-				'url' => PageGallery_UPLOAD_URL . implode('/', array_map('rawurlencode', explode('/', $filename))),
+				'url' => PageGallery_image_url($filename),
+				'thumb' => PageGallery_thumb_url($filename, true),
 			]]);
 			exit;
 		}
@@ -793,6 +819,11 @@ function PageGallery_handle_ajax($action) {
 			if (!in_array($mime, $allowed_mime)) { echo json_encode(['ok' => false, 'msg' => 'Unsupported file type']); exit; }
 			if ($file['size'] > 8 * 1024 * 1024) { echo json_encode(['ok' => false, 'msg' => 'File exceeds 8 MB']); exit; }
 
+			$subfolder = PageGallery_resolve_folder($_POST['folder'] ?? '');
+			if ($subfolder === false) { echo json_encode(['ok' => false, 'msg' => 'Invalid folder path']); exit; }
+			$dir_rel    = $subfolder !== '' ? $subfolder . '/' : '';   // '' or 'sub/dir/'
+			$target_dir = PageGallery_UPLOAD_DIR . $dir_rel;
+
 			$ext      = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
 			$safe_ext = in_array($ext, ['jpg', 'jpeg', 'png', 'gif', 'webp']) ? $ext : 'jpg';
 			// Sanitise original filename: lowercase, replace spaces/special chars with hyphens
@@ -802,25 +833,21 @@ function PageGallery_handle_ajax($action) {
 			$base = $base ?: 'image';
 			$filename = $base . '.' . $safe_ext;
 			// Handle filename collisions - append -1, -2, etc. if the file already exists
-			if (file_exists(PageGallery_UPLOAD_DIR . $filename)) {
+			if (file_exists($target_dir . $filename)) {
 				$i = 1;
-				while (file_exists(PageGallery_UPLOAD_DIR . $base . '-' . $i . '.' . $safe_ext)) { $i++; }
+				while (file_exists($target_dir . $base . '-' . $i . '.' . $safe_ext)) { $i++; }
 				$filename = $base . '-' . $i . '.' . $safe_ext;
 			}
 
-			$dest = PageGallery_UPLOAD_DIR . $filename;
+			$dest = $target_dir . $filename;
 			if (!move_uploaded_file($file['tmp_name'], $dest)) {
 				echo json_encode(['ok' => false, 'msg' => 'Upload failed']); exit;
 			}
 
-			// Generate the standard GS thumbnail the same way GS's own upload.php
-			// does, so this file behaves identically to one uploaded through the
-			// core file browser (e.g. shows a thumbnail there too).
-			$imgmanip = GSADMININCPATH . 'imagemanipulation.php';
-			if (file_exists($imgmanip)) {
-				require_once($imgmanip);
-				if (function_exists('genStdThumb')) genStdThumb('', $filename);
-			}
+			// Generate thumbnail
+			PageGallery_generate_thumb($dir_rel, $filename);
+
+			$rel_filename = $dir_rel . $filename;
 
 			$gallery = PageGallery_get_or_create_gallery($slug);
 			$db      = PageGallery_db();
@@ -828,13 +855,14 @@ function PageGallery_handle_ajax($action) {
 
 			$stmt = $db->prepare("INSERT INTO pg_images (gallery_id, filename, sort_order) VALUES (:g, :f, :o)");
 			$stmt->bindValue(':g', $gallery['id'], SQLITE3_INTEGER);
-			$stmt->bindValue(':f', $filename, SQLITE3_TEXT);
+			$stmt->bindValue(':f', $rel_filename, SQLITE3_TEXT);
 			$stmt->bindValue(':o', $max + 1, SQLITE3_INTEGER);
 			$stmt->execute();
 
 			echo json_encode(['ok' => true, 'image' => [
-				'id' => $db->lastInsertRowID(), 'filename' => $filename,
-				'url' => PageGallery_UPLOAD_URL . rawurlencode($filename),
+				'id' => $db->lastInsertRowID(), 'filename' => $rel_filename,
+				'url' => PageGallery_image_url($rel_filename),
+				'thumb' => PageGallery_thumb_url($rel_filename),
 			]]);
 			exit;
 		}
@@ -846,8 +874,7 @@ function PageGallery_handle_ajax($action) {
 			$stmt = $db->prepare("DELETE FROM pg_images WHERE id=:id");
 			$stmt->bindValue(':id', $id, SQLITE3_INTEGER);
 			$stmt->execute();
-			// Note: the underlying upload is left in place (it's part of the shared
-			// media library and may be reused elsewhere or re-added later).
+			
 			echo json_encode(['ok' => true]);
 			exit;
 		}
@@ -889,7 +916,6 @@ function PageGallery_handle_ajax($action) {
 		}
 
 		case 'delete_page_gallery': {
-			// Used by the admin overview list to fully remove a gallery + its image rows
 			$slug = $_POST['slug'] ?? '';
 			if (!$slug) { echo json_encode(['ok' => false]); exit; }
 			$gallery = PageGallery_get_gallery($slug);
@@ -913,13 +939,11 @@ function PageGallery_handle_ajax($action) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FRONT-END TEMPLATE TAG
-// Usage in a theme file: call get_page_gallery() from any template.php
-// Optional per-call overrides: get_page_gallery(['columns' => 4, 'lightbox' => false])
 // ─────────────────────────────────────────────────────────────────────────────
 
 function get_page_gallery($args = []) {
 	global $url, $SITEURL;
-	$page_url = (string)$url; // $url is a SimpleXMLElement in GS front-end context
+	$page_url = (string)$url; 
 	if (empty($page_url)) return;
 
 	$gallery = PageGallery_get_gallery($page_url);
@@ -942,7 +966,7 @@ function get_page_gallery($args = []) {
 		$thumb = PageGallery_thumb_url($img['filename']);
 		$cap = htmlspecialchars($img['caption']);
 		if (!empty($opts['lightbox'])) {
-			$full = PageGallery_UPLOAD_URL . implode('/', array_map('rawurlencode', explode('/', $img['filename'])));
+			$full = PageGallery_image_url($img['filename']);
 			$glb  = ' data-glightbox="' . ($cap !== '' ? 'title: ' . $cap : '') . '" class="pg-item glightbox-' . $gid . '"';
 			echo '<a href="' . $full . '"' . $glb . '>';
 			echo '<img src="' . $thumb . '" alt="' . $cap . '" loading="lazy">';
@@ -989,7 +1013,7 @@ function PageGallery_enqueue_lightbox() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ADMIN OVERVIEW PAGE  (register_plugin admin callback)
+// ADMIN OVERVIEW PAGE 
 // ─────────────────────────────────────────────────────────────────────────────
 
 function PageGallery_admin_page() {
